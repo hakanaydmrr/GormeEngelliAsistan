@@ -1,107 +1,105 @@
+from datetime import time
+
 import cv2
 import os
-from vision.detector import GormeEngelliGozu
+import socket
+import numpy as np
+import threading
+import speech_recognition as sr
+from PIL import Image
 from vision.llm_analyzer import ZekiAnalizci 
 from voice.tts import SesliYanit
 
+# --- YAPILANDIRMA ---
+WAKE_WORD = "asistan"
+UDP_IP = "127.0.0.1"
+UDP_PORT = 6050
+son_kare = None 
+kilid = threading.Lock()
+
 def get_api_key():
-    secret_path = "secret"
-    if not os.path.exists(secret_path):
-        secret_path = "../secret"
+    for path in ["secret", "../secret"]:
+        if os.path.exists(path):
+            with open(path, "r") as f: return f.read().strip()
+    return None
+
+def unity_goz_dongusu():
+    global son_kare
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((UDP_IP, UDP_PORT))
+    while True:
+        try:
+            data, _ = sock.recvfrom(65536)
+            nparr = np.frombuffer(data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                with kilid: son_kare = frame.copy()
+                cv2.imshow("Yaver - Goz", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+        except: continue
+
+def profesyonel_ses_al(recognizer, source):
+    """Gürültü filtresi artırılmış ses algılama."""
     try:
-        with open(secret_path, "r") as f:
-            return f.read().strip()
-    except Exception:
-        print("[HATA]: 'secret' dosyası bulunamadı!")
+        recognizer.adjust_for_ambient_noise(source, duration=0.8)
+        
+        recognizer.energy_threshold = 1000 
+        
+        print("[SİSTEM]: Dinliyorum...")
+        audio = recognizer.listen(source, timeout=5, phrase_time_limit=8)
+        return recognizer.recognize_google(audio, language="tr-TR")
+    except:
         return None
 
 def main():
-    API_KEY = get_api_key()
-    if not API_KEY: return
+    global son_kare
+    api_key = get_api_key()
+    if not api_key: return
 
-    # Bileşenleri başlat
-    goz = GormeEngelliGozu()
-    beyin = ZekiAnalizci(API_KEY)
-    sesli_asistan = SesliYanit() 
-    
-    kamera = cv2.VideoCapture(0)
-    if not kamera.isOpened():
-        print("Hata: Kamera erişimi sağlanamadı!")
-        return
+    beyin = ZekiAnalizci(api_key)
+    asistan_ses = SesliYanit()
+    threading.Thread(target=unity_goz_dongusu, daemon=True).start()
 
-    print("\n--- SİSTEM AKTİF ---")
-    print("Detaylı analiz için 'a', çıkış için 'q' tuşuna basın.")
+    recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = True
 
-    try:
+    print(f"[SİSTEM]: Yaver Hazır. '{WAKE_WORD}' diyerek başlayabilirsiniz.")
+
+    with sr.Microphone() as source:
         while True:
-            basarili, kare = kamera.read()
-            if not basarili: break
+            try:
+                audio = recognizer.listen(source, timeout=2, phrase_time_limit=3)
+                if WAKE_WORD in recognizer.recognize_google(audio, language="tr-TR").lower():
+                    asistan_ses.konus("Efendim Furkan?", bekle=True)
+                    
 
-            # 1. YOLU (Hızlı Tespit - Ekrana anlık kutu çizer)
-            nesneler = goz.nesneleri_tani(kare)
-            for n in nesneler:
-                x1, y1, x2, y2 = map(int, n["kutu"])
-                cv2.rectangle(kare, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            # 2. Görüntüyü Göster
-            cv2.imshow("Görme Engelli Asistan", kare)
-
-            # 3. Tuş Kontrolü (Donmayı önlemek için döngünün en sonunda)
-            tus = cv2.waitKey(1) & 0xFF
-            
-            if tus == ord('a'):
-                print("[SİSTEM]: Bulut analizi başlatıldı...")
-                dosya_adi = "analiz_anlik.jpg"
-                cv2.imwrite(dosya_adi, kare)
-
-                # Gemini Analizi
-                cevap = beyin.analiz_et(dosya_adi)
-
-                # Seslendirme Süzgeci
-                if (
-                    cevap
-                    and len(cevap.strip()) > 5
-                    and "Analiz hatası" not in cevap
-                    and "Hata:" not in cevap
-                    and "Kota doldu" not in cevap
-                    and "API yanıtı boş" not in cevap
-                ):
-                    print(f"\n[ASİSTAN]: {cevap}\n")
-                    sesli_asistan.konus(cevap)
-                    cv2.waitKey(3000)  # Sonuçları görmek için kısa bir bekleme
-                else:
-                    print(f"\n[SİSTEM]: {cevap}\n")
-
-                if os.path.exists(dosya_adi):
-                    try:
-                        os.remove(dosya_adi)
-                    except:
-                        pass
-
-            elif tus == ord('t'):
-                print("[SİSTEM]: Dil ayarı bildirimi tetiklendi.")
-                sesli_asistan.konus("Seslendirme dili Türkçe olarak ayarlandı.", dil_bilgisi_ekle=True)
-
-            elif tus == ord('q'):
-                print("Sistem kapatılıyor...")
-                break
-
-    finally:
-        # Kamera ve pencereleri kapat
-        if 'kamera' in locals():
-            kamera.release()
-        cv2.destroyAllWindows()
-        
-        # --- SES DOSYALARINI TEMİZLE ---
-        print("[SİSTEM]: Geçici ses dosyaları temizleniyor...")
-        for dosya in os.listdir("."):
-            if dosya.startswith("yanit_") and dosya.endswith(".mp3"):
-                try:
-                    os.remove(dosya)
-                except Exception as e:
-                    print(f"[UYARI]: {dosya} silinemedi: {e}")
-        
-        print("Kamera ve pencereler kapatıldı, temizlik tamamlandı.")
+                    deneme = 0
+                    while deneme < 3:
+                        soru = profesyonel_ses_al(recognizer, source)
+                        if soru:
+                            print(f"[KULLANICI]: {soru}")
+                            with kilid:
+                                if son_kare is not None:
+                                    # Görüntü Dönüşümü
+                                    img = Image.fromarray(cv2.cvtColor(son_kare, cv2.COLOR_BGR2RGB))
+                                    cevap = beyin.analiz_et(img, soru=soru)
+                                    print(f"[ASİSTAN]: {cevap}")
+                                    asistan_ses.konus(cevap, bekle=True)
+                                    
+                                    time.sleep(3) # Cevap sonrası kısa bir bekleme
+                                
+                                    if "tekrar sorar mısın" not in cevap.lower() and "hata" not in cevap.lower():
+                                        break 
+                                    else:
+                                        deneme += 1 # Bir deneme hakkı düş ve tekrar 'Dinliyorum' aşamasına geç
+                                else:
+                                    asistan_ses.konus("Unity'den görüntü gelmiyor.", bekle=True)
+                                    break
+                        else:
+                            deneme += 1
+                            if deneme < 3:
+                                asistan_ses.konus("Anlayamadım, tekrar eder misiniz?", bekle=True)
+            except: continue
 
 if __name__ == "__main__":
     main()
