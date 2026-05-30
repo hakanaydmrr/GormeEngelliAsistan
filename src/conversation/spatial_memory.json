@@ -1,0 +1,46 @@
+{
+    "odalar": {
+        "Mutfak": {
+            "nesneler": [
+                "buzdolabı",
+                "fırın",
+                "mikrodalga",
+                "ekmek kızartma makinesi",
+                "lavabo",
+                "bardak",
+                "çatal",
+                "bıçak"
+            ]
+        },
+        "Oturma Odası": {
+            "nesneler": [
+                "televizyon",
+                "koltuk",
+                "sehpa",
+                "kitaplık",
+                "kumanda",
+                "vazo"
+            ]
+        },
+        "Yatak Odası": {
+            "nesneler": [
+                "yatak",
+                "gardırop",
+                "komodin",
+                "yastık",
+                "ayna",
+                "lamba"
+            ]
+        },
+        "Banyo": {
+            "nesneler": [
+                "çamaşır makinesi",
+                "duş",
+                "ayna",
+                "havlu",
+                "diş fırçası",
+                "klozet"
+            ]
+        }
+    }
+}
