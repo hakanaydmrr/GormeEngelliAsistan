@@ -1,4 +1,6 @@
 import cv2
+import math
+import re
 import numpy as np
 import socket
 import threading
@@ -8,6 +10,7 @@ from PIL import Image
 import os
 from dotenv import load_dotenv
 from pathlib import Path
+from typing import Dict
 
 from conversation import AssistantProfileStore, IntentRouter, SpatialMemoryStore, WeatherService
 from voice.tts import SesliYanit
@@ -15,7 +18,7 @@ from vision.llm_analyzer import ZekiAnalizci
 from vision.detector import GormeEngelliGozu
 
 PROJE_KOK = Path(__file__).resolve().parent.parent
-dotenv_path = PROJE_KOK / ".env"
+dotenv_path = PROJE_KOK / ".env" 
 load_dotenv(dotenv_path=dotenv_path)
 
 api_key = os.getenv("GEMINI_API_KEY1") or os.getenv("GEMINI_API_KEY")
@@ -55,6 +58,37 @@ def wake_word_matches(text: str, wake_word: str = WAKE_WORD) -> bool:
 
     return False
 
+class ObstacleFilter:
+    """
+    Engel bildirimlerini uzamsal (ROI) ve zamansal (Debounce) olarak filtreler.
+    Memory: Aktif engel sayısı kadar O(N). Time: O(1) per check.
+    """
+    def __init__(self, debounce_time: float = 4.0, max_distance: float = 1.5, fov_angle: float = 30.0):
+        self.debounce_time = debounce_time
+        self.max_distance = max_distance
+        self.fov_angle = fov_angle
+        self._last_warning_times: Dict[str, float] = {}
+
+    def should_warn(self, obj_id: str, distance: float, angle: float) -> bool:
+        # 1. Uzamsal Filtre: Hedef uzakta veya yürüme konisi dışındaysa yoksay.
+        if distance > self.max_distance or abs(angle) > self.fov_angle:
+            return False
+
+        current_time = time.time()
+        last_time = self._last_warning_times.get(obj_id, 0.0)
+
+        if (current_time - last_time) >= self.debounce_time:
+            self._last_warning_times[obj_id] = current_time
+            return True
+
+        return False
+
+
+def estimate_distance_from_area(area_ratio: float, reference_scale: float = 0.60) -> float:
+    if area_ratio <= 0:
+        return float("inf")
+    return max(0.1, reference_scale / math.sqrt(area_ratio))
+
 
 def is_wake_word_only(text: str) -> bool:
     temiz = normalize_tr(text)
@@ -71,13 +105,17 @@ def get_api_key():
 
 def unity_udp_dinleyici(gozu_nesnesi, spatial_store, asistan_ses):
     global son_kare, mevcut_konum, anlik_radar, anlik_pusula
+    import re # Virgül ve sayı temizlemek için
     
+    import socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
     print(f"[SİSTEM]: Unity UDP dinleyicisi başlatıldı: {UDP_IP}:{UDP_PORT}")
 
     KRITIK_ENGELLER = {"chair", "table", "desk", "box", "bed", "toilet", "door"}
     son_okunan_spiker = "" 
+    son_okuma_zamani = 0
+    cooldown_suresi = 3.0
 
     while True:
         try:
@@ -92,18 +130,50 @@ def unity_udp_dinleyici(gozu_nesnesi, spatial_store, asistan_ses):
                     parcalar = metin_kismi.split('|')
                     gelen_spiker = parcalar[1] if len(parcalar) > 1 else ""
                     anlik_radar = parcalar[2] if len(parcalar) > 2 else ""
-                    
-                    # Pusulayı güncelle
                     anlik_pusula = gelen_spiker.strip()
                     
-                    # 🔥 DİNAMİK YÖNLENDİRME (Pusula verisi değişirse asistanı tetikle)
-                    if "Rota yok" not in anlik_pusula and "Seni yönlendiriyorum" not in anlik_pusula:
-                        if anlik_pusula != son_okunan_spiker:
-                            print(f"[REHBER]: {anlik_pusula}")
-                            asistan_ses.konus(anlik_pusula, bekle=False)
-                            son_okunan_spiker = anlik_pusula
-                
-                # Resim işleme ve YOLO (Aynı kalacak)
+                    yasakli_kelimeler = ["rota yok", "yönlendiriyorum", "hedefe yönlendir", "bekleniyor"]
+                    
+                    if not any(yasak in anlik_pusula.lower() for yasak in yasakli_kelimeler):
+                        temiz_pusula = normalize_tr(anlik_pusula)
+                        temiz_son_okunan = normalize_tr(son_okunan_spiker)
+                        su_an = time.time()
+                        zaman_farki = su_an - son_okuma_zamani
+                        
+                        is_acil_durum = "DİKKAT" in anlik_pusula
+                        
+                        # Cümle iskeletinden sayıları VE virgülleri temizliyoruz ("1,1" -> "")
+                        iskelet_anlik = re.sub(r'[\d\,\.]', '', temiz_pusula).strip()
+                        iskelet_eski = re.sub(r'[\d\,\.]', '', temiz_son_okunan).strip()
+                        ayni_engel_mi = (iskelet_anlik == iskelet_eski)
+
+                        if len(temiz_pusula) > 3:
+                            if is_acil_durum:
+                                if not ayni_engel_mi:
+                                    # YENİ ENGEL
+                                    if zaman_farki > 1.0:
+                                        print(f"[REHBER - ACİL]: {anlik_pusula}")
+                                        # Hata çıksa bile süre güncellensin diye ÖNCE atama yapıyoruz!
+                                        son_okunan_spiker = anlik_pusula
+                                        son_okuma_zamani = su_an
+                                        asistan_ses.konus(anlik_pusula, bekle=False)
+                                else:
+                                    # AYNI ENGEL - Spam koruması için ses motorunun bitmesini bekle
+                                    if zaman_farki > cooldown_suresi and not asistan_ses.is_speaking.is_set():
+                                        print(f"[REHBER - GÜNCELLEME]: {anlik_pusula}")
+                                        son_okunan_spiker = anlik_pusula
+                                        son_okuma_zamani = su_an
+                                        asistan_ses.konus(anlik_pusula, bekle=False)
+                            else:
+                                # NORMAL YOL TARİFİ
+                                if temiz_pusula != temiz_son_okunan:
+                                    if zaman_farki > cooldown_suresi and not asistan_ses.is_speaking.is_set():
+                                        print(f"[REHBER]: {anlik_pusula}")
+                                        son_okunan_spiker = anlik_pusula
+                                        son_okuma_zamani = su_an
+                                        asistan_ses.konus(anlik_pusula, bekle=False)
+                    
+                # Resim işleme ve YOLO
                 nparr = np.frombuffer(resim_bytes, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -112,6 +182,7 @@ def unity_udp_dinleyici(gozu_nesnesi, spatial_store, asistan_ses):
                         son_kare = frame.copy()
         except Exception as e:
             continue
+
 
 def sahne_ozeti_olustur(nesneler, kare_genisligi):
     if not nesneler:
@@ -137,22 +208,65 @@ def sahne_ozeti_olustur(nesneler, kare_genisligi):
     return ", ".join(parcalar)
 
 
-def soruyu_zenginlestir(soru, sahne_ozeti, profil_ozeti, anlik_konum, pusula_verisi):
+def is_room_description_request(soru: str) -> bool:
+    text = soru.lower()
+    anahtarlar = [
+        "neredeyim", "nerede olduğum", "nerede olduğumu", "odayı", "odadayım", "odamı",
+        "hangi oda", "bulunduğum oda", "bulunduğum odayı betimler", "bulunduğum odayı betimler misin",
+        "şu an neredeyim", "neredeyim",
+        # Görsel betimleme için sık kullanılan sorular
+        "ne var", "önümde ne var", "önümde ne", "karşımda ne var", "karşımda ne", "şu an önümde ne var",
+        "odada ne var", "odayı betimler misin", "odamda ne var"
+    ]
+    return any(k in text for k in anahtarlar)
+
+
+def soruyu_zenginlestir(soru, sahne_ozeti, profil_ozeti, anlik_konum, pusula_verisi, room_request: bool = False):
+    if room_request:
+        return (
+            "Sen 'Yaver' adlı, görme engelli bireyler için profesyonel bir görsel asistanısın."
+            " Bu soruda kullanıcı bulunduğu odayı ve konumunu bilmek istiyor."
+            " Lütfen gördüğün oda hakkında açık, kısa ve net bir tanım yap. Rotadan veya yönlendirmeden kaçın."
+            " Cevabını şu formatta ver: 'Oturma odasındasın, sağında masa, solunda koltuk var.'"
+            " 15 kelimeyi geçme.\n\n"
+            f"KULLANICI VERİLERİ:\n"
+            f"- Konum: {anlik_konum}\n"
+            f"- Görüntüdeki Nesneler: {sahne_ozeti}\n\n"
+            "REHBERLİK PROTOKOLÜ:\n"
+            "1. Bu soruda rota bilgisi verme; sadece odayı, duvarları, zemini ve önemli nesnelerin yerini anlat.\n"
+            "2. Eğer odayı kesin olarak belirleyebiliyorsan açıkla. Eğer emin değilsen, görsel detaylarla tahminini destekle.\n"
+            "3. KISITLAMA: 15 kelimeyi geçme, ama oda tanımı yeterince açık olsun.\n"
+        )
+
     return (
-        "Sen bir NAVİGASYON ASİSTANISIN. Kullanıcıyı yatağa/hedefe en kısa yoldan ulaştırmakla görevlisin.\n"
-        "NESNELERİ BETİMLEME. Sadece engelleri uyar.\n\n"
+        "Sen 'Yaver' adlı, görme engelli bireyler için NAVİGASYON ASİSTANISIN. Kullanıcıyı hedefe en kısa yoldan güvenle ulaştır.\n"
+        "NESNELERİ GEREKSİZ BETİMLEME. Sadece yürümeyi engelleyecek nesneleri uyar.\n\n"
         
         f"KULLANICI VERİLERİ:\n"
         f"- Konum: {anlik_konum}\n"
         f"- Hedef Yönü (PUSULA): {pusula_verisi}\n"
-        f"- Yol Üzerindeki Engeller: {sahne_ozeti}\n\n"
+        f"- Yol Üzerindeki Engeller (YOLO Tespiti): {sahne_ozeti}\n\n"
         
-        "REHBERLİK PROTOKOLÜ (HAYATİ):\n"
-        "1. KESİN EMİR: Kullanıcıya ilk cümlende mutlaka PUSULA VERİSİ'ni söyle. Örn: 'Hedef sağ arka tarafında, sağa dön.'\n"
-        "2. ENGEL YÖNETİMİ: PUSULA VERİSİ ile yol üzerindeki nesneleri birleştir. 'Sağa dönmelisin ama önünde koltuk var, koltuğun solundan geçerek sağa yönel' de.\n"
-        "3. KISITLAMA: Asla 15 kelimeyi geçme. Uzun anlatım yasak. Doğal, komut odaklı, insan sesli bir rehber ol.\n"
-        "4. ODALANMA: Sadece 'nereye döneceğini' ve 'nasıl yürüyeceğini' söyle. Çevre betimlemesini sadece yürümeni engelleyen nesneler için yap.\n"
+        "REHBERLİK PROTOKOLÜ (HAYATİ VE KESİN KURALLAR):\n"
+        "1. KESİN EMİR: İlk cümlen mutlaka PUSULA VERİSİ olsun. Örn: 'Hedef sağ arka tarafında, sağa dön.'\n"
+        "2. HALÜSİNASYON KİLİDİ: Eğer 'Engeller' kısmında 'Belirgin nesne tespit edilemedi.' yazıyorsa, ASLA nesne uydurma ve tahmin yapma! Sadece pusulayı söyleyip bitir.\n"
+        "3. ENGEL YÖNETİMİ: Eğer gerçekten bir engel tespit edilmişse, pusula verisiyle birleştir. 'Sağa dönmelisin ama önünde koltuk var, solundan geç' de.\n"
+        "4. KISITLAMA: Asla 15 kelimeyi geçme. Asla kullanıcıdan çevresini betimlemesini isteme.\n"
     )
+
+
+def kisa_oda_tanimi(cevap: str) -> str:
+    if not cevap:
+        return cevap
+    cumleler = re.split(r'(?<=[.!?])\s+', cevap.strip())
+    if cumleler:
+        ilk = cumleler[0].strip()
+        kelimeler = ilk.split()
+        if len(kelimeler) <= 18:
+            return ilk
+        return " ".join(kelimeler[:18]) + '.'
+    kelimeler = cevap.split()
+    return " ".join(kelimeler[:18]) + '.'
 
 
 def genel_fallback_cevap(soru, sahne_ozeti):
@@ -173,8 +287,10 @@ def genel_fallback_cevap(soru, sahne_ozeti):
 def sohbet_baglamini_olustur(profil_store, gecmis):
     baglam = (
         f"Kullanıcı profili: {profil_store.describe()}.\n"
-        "Ton: sıcak, zeki, esprili ama saygılı.\n"
-        "Kullanıcı ile günlük hayatta konuşur gibi doğal ve kısa cevaplar ver."
+        "SENİN KİMLİĞİN: Sen, 'Yaver' adında, görme engelli bireylere rehberlik eden bir yapay zeka asistanısın.\n"
+        "KESİN KURAL: Asla kullanıcıdan çevresini veya nesneleri betimlemesini isteme! Kullanıcı görme engellidir. Çevreyi görmek ve analiz etmek senin görevidir.\n"
+        "Eğer kullanıcı 'döndüm', 'ilerledim', 'tamam' gibi navigasyon onayları verirse, sadece 'Anlaşıldı, bir sonraki adımı bekliyorum' veya 'Kameradan yeni rotayı kontrol ediyorum' gibi kısa onay cümleleri kur.\n"
+        "Ton: sıcak, net, güven verici ve kısa."
     )
 
     if gecmis:
@@ -185,14 +301,24 @@ def sohbet_baglamini_olustur(profil_store, gecmis):
 
 def run_text_reply(beyin, asistan_ses, soru, profil_store, gecmis):
     baglam = sohbet_baglamini_olustur(profil_store, gecmis)
-    cevap = beyin.sohbet_et(soru, baglam=baglam)
-    duzgun_cevap = " ".join((cevap or "").split())
+    try:
+        cevap = beyin.sohbet_et(soru, baglam=baglam)
+        duzgun_cevap = " ".join((cevap or "").split())
+    except Exception as e:
+        print(f"[SOHBET HATA]: {e}")
+        duzgun_cevap = "Şu an sohbete bağlanamıyorum. Lütfen biraz sonra tekrar dene."
+
+    if not duzgun_cevap.strip():
+        duzgun_cevap = "Şu an net bir cevap veremiyorum."
 
     print(f"[ASİSTAN - SOHBET]: {duzgun_cevap}")
-    asistan_ses.konus(duzgun_cevap, bekle=True) 
+    try:
+        asistan_ses.konus(duzgun_cevap, bekle=True)
+    except Exception as e:
+        print(f"[SES MOTORU HATA]: {e}")
     return duzgun_cevap
 
-def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store, anlik_konum, radar_verisi, spatial_store, pusula_verisi):
+def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store, anlik_konum, radar_verisi, spatial_store, pusula_verisi, obstacle_filter: ObstacleFilter, nav_target: str | None = None):
     if kare_kopyasi is None:
         return "Görüntü verisi alınamadı."
 
@@ -205,22 +331,100 @@ def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store,
     img = Image.fromarray(cv2.cvtColor(iyilestirilmis_kare, cv2.COLOR_BGR2RGB))
     
     nesneler = gozu.nesneleri_tani(iyilestirilmis_kare)
-    sahne_ozeti = sahne_ozeti_olustur(nesneler, iyilestirilmis_kare.shape[1])
     tahmin_edilen_oda = spatial_store.oda_tahmin_et(nesneler)
     etkin_konum = tahmin_edilen_oda or anlik_konum
-    
+
+    oda_talepli = is_room_description_request(soru)
+    soru_lower = soru.lower()
+    kare_genisligi = iyilestirilmis_kare.shape[1]
+    all_scene_summary = sahne_ozeti_olustur(nesneler, kare_genisligi)
+
+    # Eğer kullanıcı 'önümde' veya 'karşımda' gibi kelimeler kullanıyorsa, öne odaklı kısa betimleme yap.
+    front_request = any(k in soru_lower for k in ("önümde", "karşımda", "önümde ne", "karşımda ne", "önümde ne var", "karşımda ne var"))
+
+    if oda_talepli:
+        sahne_ozeti = all_scene_summary or "Belirgin nesne tespit edilemedi."
+    else:
+        risk_nesneler = []
+        for nesne in nesneler:
+            offset = (nesne["merkez_x"] - (kare_genisligi / 2)) / (kare_genisligi / 2)
+            angle = offset * obstacle_filter.fov_angle
+            distance = estimate_distance_from_area(nesne["alan_orani"])
+            obj_id = f"{nesne['ad']}|{int(nesne['merkez_x'])}|{int(nesne['merkez_y'])}"
+
+            if obstacle_filter.should_warn(obj_id, distance, angle):
+                risk_nesneler.append(nesne)
+
+        if risk_nesneler:
+            risk_ozeti = sahne_ozeti_olustur(risk_nesneler, kare_genisligi)
+            sahne_ozeti = f"Önünde kritik engeller: {risk_ozeti}"
+        else:
+            sahne_ozeti = "Önünde belirgin bir acil risk görünmüyor."
+
     # --- 2. ADIM: ZENGİNLEŞTİRİLMİŞ SORGULAMA (Pusula Verisi ile) ---
-    sorgu = soruyu_zenginlestir(soru, sahne_ozeti, profil_store.describe(), etkin_konum, pusula_verisi)
+    sorgu = soruyu_zenginlestir(
+        soru, sahne_ozeti, profil_store.describe(), etkin_konum, pusula_verisi,
+        room_request=oda_talepli
+    )
     
     if radar_verisi and "belirgin bir nesne yok" not in radar_verisi.lower():
         sorgu += f"\n\n[DİNAMİK RADAR VERİSİ]:\n{radar_verisi}"
-    
+
     # --- 3. ADIM: ANALİZ ---
-    cevap = beyin.analiz_et(img, soru=sorgu)
+    # Eğer kullanıcı oda betimlemesi istedi ancak sahnede tek bir nesne tespit edildiyse (ör: yatak),
+    # kullanıcının niyetinin hedefe yönlendirme olabileceğini varsay ve navigasyon akışına çevir.
+    if oda_talepli and len(nesneler) == 1:
+        sadece = nesneler[0].get('ad','').lower()
+        if sadece in {'yatak', 'bed', 'yatak odası'}:
+            nav_target = nesneler[0].get('ad')
+
+    # Navigasyon hedefi açıkça belirtilmişse navigasyon akışına çevir
+    if nav_target:
+        sorgu = f"HEDEF: {nav_target}. {sorgu}"
+        system_override = (
+            "Sen görme engelli bir birey için mikro-navigasyon sağlayan bir asistansın. "
+            "Kullanıcının hedefe ulaşması için sadece ilk birkaç adımı ver; asla tüm rotayı söyleme."
+        )
+    else:
+        if oda_talepli:
+            system_override = (
+                "Sen görme engelli bir birey için profesyonel bir görsel asistanısın. "
+                "Bu soruda kullanıcı bulunduğu odayı ve mevcut konumunu anlamak istiyor. "
+                "Lütfen sadece oda tanımı, çevre ve nesnelerin konumunu ver; rota veya hedef yönlendirmesi yapma."
+            )
+        else:
+            system_override = None
+
+    # Ön odaklı kısa betimleme varsa doğrudan nesneleri listeleyelim
+    if front_request and not nav_target and not oda_talepli:
+        front_objects = []
+        for nesne in nesneler:
+            konum_x = nesne.get("merkez_x", 0)
+            if konum_x > (kare_genisligi/3) and konum_x < (kare_genisligi*2/3):
+                front_objects.append(nesne)
+
+        if front_objects:
+            duzgun_cevap = ", ".join([f"{o.get('ad')}" for o in front_objects])
+            print(f"[ASİSTAN - GÖRSEL - ÖN]: {duzgun_cevap}")
+            try:
+                asistan_ses.konus(duzgun_cevap, bekle=True)
+            except Exception as e:
+                print(f"[SES MOTORU HATA]: {e}")
+            return duzgun_cevap
+
+    try:
+        cevap = beyin.analiz_et(img, soru=sorgu, system_instruction=system_override)
+    except Exception as e:
+        print(f"[GÖRSEL HATA]: {e}")
+        cevap = None
+
     duzgun_cevap = " ".join((cevap or "").split())
 
     if len(duzgun_cevap) < 20 or len(duzgun_cevap.split()) < 4:
         duzgun_cevap = genel_fallback_cevap(soru, sahne_ozeti)
+
+    if oda_talepli:
+        duzgun_cevap = kisa_oda_tanimi(duzgun_cevap)
 
     print(f"[ASİSTAN - GÖRSEL]: {duzgun_cevap}")
     asistan_ses.konus(duzgun_cevap, bekle=True)
@@ -263,9 +467,10 @@ def main():
     gozu = GormeEngelliGozu()
     asistan_ses = SesliYanit()
     profil_store = AssistantProfileStore()
-    router = IntentRouter()
     spatial_store = SpatialMemoryStore()
+    router = IntentRouter(spatial_store=spatial_store)
     weather_service = WeatherService()
+    obstacle_filter = ObstacleFilter()
     konusma_gecmisi = []
 
     otopilot_hedefler = {
@@ -307,10 +512,8 @@ def main():
 
         print("[SİSTEM]: Mikrofon hazır. Dinliyorum...")
 
-        print("[SİSTEM]: Mikrofon hazır. Dinliyorum...")
-
     while True:
-        # 🔥 ULTRA SIZDIRMAZ KORUMA
+        # 🔥 1. KORUMA: SESSİZ TIKANMAYI TESPİT ET (DEBUG)
         if asistan_ses.is_speaking.is_set():
             time.sleep(0.2)
             continue
@@ -319,9 +522,18 @@ def main():
 
         try:
             with sr.Microphone() as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = recognizer.listen(source, timeout=None, phrase_time_limit=None)
-                if asistan_ses.is_speaking.is_set(): continue
+                # 0.5 saniye çok uzun, gecikmeyi azaltmak için 0.2'ye çektik
+                recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                
+                # 🔥 2. KORUMA: DEADLOCK ÖNLEYİCİ (TIMEOUT)
+                # timeout=3: 3 saniye hiç ses gelmezse hata verip döngüyü başa sarar (Kilitlenmeyi önler)
+                # phrase_time_limit=10: Kullanıcı 10 saniyeden uzun konuşursa zorla keser
+                audio = recognizer.listen(source, timeout=3, phrase_time_limit=10)
+                
+                # Dinleme bittiğinde asistan araya girdiyse algılamayı iptal et
+                if asistan_ses.is_speaking.is_set(): 
+                    continue
+                    
                 komut = recognizer.recognize_google(audio, language="tr-TR").strip()
 
             if not komut: continue
@@ -329,16 +541,17 @@ def main():
 
             print(f"[KULLANICI - HAM]: {komut}")
 
-            # 1. ADIM: Wake Word Kontrolü (Soru değişkenini burada kesinleştiriyoruz)
+            # 1. ADIM: Wake Word Kontrolü
             wake_word_var = wake_word_matches(komut)
             if wake_word_var and is_wake_word_only(komut):
                 asistan_ses.konus(f"{profil_store.get_preferred_name()}, dinliyorum.", bekle=True)
                 with sr.Microphone() as soru_source:
-                    recognizer.adjust_for_ambient_noise(soru_source, duration=0.5)
-                    soru_audio = recognizer.listen(soru_source, timeout=5, phrase_time_limit=None)
+                    recognizer.adjust_for_ambient_noise(soru_source, duration=0.2)
+                    # Soru için de kilitlenme önleyici ekledik
+                    soru_audio = recognizer.listen(soru_source, timeout=5, phrase_time_limit=15)
                     soru = recognizer.recognize_google(soru_audio, language="tr-TR").strip()
             else:
-                soru = komut # Wake word yoksa komut direkt soru oluyor
+                soru = komut
 
             # 2. ADIM: Boşluk kontrolü
             if not soru or soru.strip() == "":
@@ -350,67 +563,63 @@ def main():
             # 3. ADIM: Otopilot Kontrolü (Router'dan önce)
             soru_lower = soru.lower()
             bulunan_hedef = None
-            for anahtar, hedef_adi in otopilot_hedefler.items():
-                if anahtar in soru_lower:
-                    bulunan_hedef = hedef_adi
-                    break
             
-            # ... (Önceki kodlar)
+            # Negatif kelimeler veya soru kelimeleri içeriyorsa rota komutu değildir!
+            iptal_kelimeleri = ["yok", "değil", "hayır", "nerede", "yanlış", "görmüyorum"]
+            is_iptal = any(k in soru_lower for k in iptal_kelimeleri)
+
+            if not is_iptal:
+                for anahtar, hedef_adi in otopilot_hedefler.items():
+                    if anahtar in soru_lower:
+                        # Rota komutu olduğundan emin olmak için ya cümle kısa olmalı (örn: "yatağa git") 
+                        # ya da bir yönlendirme fiili içermeli
+                        navigasyon_fiilleri = ["götür", "git", "yönlendir", "tarif", "istiyorum"]
+                        if len(soru_lower.split()) <= 3 or any(f in soru_lower for f in navigasyon_fiilleri):
+                            bulunan_hedef = hedef_adi
+                            break
             
             if bulunan_hedef:
                 print(f"[SİSTEM]: Otopilot hedefi algılandı -> {bulunan_hedef}")
                 asistan_ses.konus(f"{bulunan_hedef} rotası hesaplandı, yola çıkıyorum.", bekle=True)
                 
-                # --- İŞTE BU BLOĞU BURAYA EKLE ---
                 try:
                     udp_hedef_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    # Unity'nin dinlediği port 6051'e gönderiyoruz
                     udp_hedef_sock.sendto(f"{bulunan_hedef}".encode('utf-8'), ("127.0.0.1", 6051))
                     udp_hedef_sock.close()
                     print(f"[SİSTEM]: Unity'ye hedef gönderildi: {bulunan_hedef}")
                 except Exception as e:
                     print(f"[HATA]: Otopilot sinyali Unity'ye gönderilemedi: {e}")
-                # ---------------------------------
                 
                 continue # Hedef belirlendiği için döngünün başına dön
             
             # ... (router.route(komut) gibi diğer kodlar aşağıda devam eder)
             route = router.route(komut)
-            
-            if not soru or soru.strip() == "":
-                print("[SİSTEM]: Boş komut algılandı, dinlemeye devam...")
-                continue
 
-            print(f"[KULLANICI]: {soru}")
-
-            # ======= 🔥 HAKAN'IN OTOPİLOT NİYET KONTROLÜ 🔥 =======
             soru_lower = soru.lower()
-            bulunan_hedef = None
             
-            # Burada 'otopilot_hedefler' sözlüğünü main() içinde tanımlamış olmalısın
-            for anahtar, hedef_adi in otopilot_hedefler.items():
-                if anahtar in soru_lower:
-                    bulunan_hedef = hedef_adi
-                    break
-            
-            if bulunan_hedef:
-                print(f"[SİSTEM]: Otopilot hedefi algılandı -> {bulunan_hedef}")
-                asistan_ses.konus(f"{bulunan_hedef} rotası hesaplandı, yola çıkıyorum.", bekle=True)
-                try:
-                    udp_hedef_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    udp_hedef_sock.sendto(f"HEDEF: {bulunan_hedef}".encode('utf-8'), ("127.0.0.1", 6051))
-                    udp_hedef_sock.close()
-                except Exception as e:
-                    print(f"[HATA]: Otopilot sinyali gönderilemedi: {e}")
-                continue
+            # Öncelikle IntentRouter'ın kararını ve güven skorunu kontrol edelim.
+            # Eğer router 'vision' olarak güçlü bir güvene sahipse (>= threshold),
+            # görsel akışı zorunlu kılalım; aksi halde kelime tabanlı fallback kullanılır.
+            vision_threshold = 0.80
+            is_gorsel = False
+            is_navigasyon = False
 
-            # ======= HAKAN'IN SIZDIRMAZ GÖREV KİLİDİ MAKSİMUM SEVİYE =======
-            soru_lower = soru.lower()
-            gorsel_kelimeler = ["betimle", "ne var", "karşımda", "karsimda", "görüyorsun", "goruyorsun", "bak", "oda", "konumu"]
+            suppress_fallback = False
+            if hasattr(route, 'intent') and hasattr(route, 'confidence'):
+                if route.intent == "vision" and route.confidence >= vision_threshold:
+                    is_gorsel = True
+                # Eğer router internet arama niyetiyle yüksek güven döndüyse, görsele geçme
+                # ve fallback kelime kontrolünü devre dışı bırak.
+                elif route.intent in {"internet_search", "weather"} and route.confidence >= 0.80:
+                    is_gorsel = False
+                    suppress_fallback = True
+
+            # Fallback: basit kelime tabanlı tetikleyiciler korunsun (ancak yüksek güvenli non-vision intent'ler için atla)
+            if not is_gorsel and not suppress_fallback:
+                gorsel_kelimeler = ["betimle", "ne var", "karşımda", "karsimda", "görüyorsun", "goruyorsun", "bak", "oda", "konumu", "döndüm", "dondum", "ilerledim", "geldim", "attım"]
+                is_gorsel = any(k in soru_lower for k in gorsel_kelimeler)
+
             navigasyon_kelimeler = ["götür", "gotur", "tarif", "nasıl giderim", "nasil giderim", "yol göster", "gitmek istiyorum", "götürür müsün"]
-
-            # Eğer soruda bu kritik kelimelerden biri bile geçiyorsa ROUTER'A HİÇ BAKMA, DİREKT VİZYONA SOK!
-            is_gorsel = any(k in soru_lower for k in gorsel_kelimeler)
             is_navigasyon = any(k in soru_lower for k in navigasyon_kelimeler)
             
 
@@ -424,9 +633,20 @@ def main():
 
                 if kare_kopyasi is not None:
                     # Pusula verisini fonksiyona gönderiyoruz
+                    # Öncelikle router'ın çıkardığı hedefi kullan; yoksa anahtar eşlemeyle yedekle
+                    detected_target = None
+                    if hasattr(route, 'target') and route.target:
+                        detected_target = route.target
+                    else:
+                        for anahtar, hedef_adi in otopilot_hedefler.items():
+                            if anahtar in soru_lower:
+                                detected_target = hedef_adi
+                                break
+
                     yanit = run_visual_reply(
                         beyin, gozu, asistan_ses, soru, kare_kopyasi, 
-                        profil_store, mevcut_konum, giden_radar, spatial_store, giden_pusula
+                        profil_store, mevcut_konum, giden_radar, spatial_store, giden_pusula,
+                        obstacle_filter, nav_target=detected_target
                     )
                     konusma_gecmisi.append(f"Kullanıcı: {soru}")
                     konusma_gecmisi.append(f"Asistan: {yanit}")

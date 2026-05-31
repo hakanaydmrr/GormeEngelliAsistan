@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import time
+from PIL import Image
+import requests
 from google import genai
 from google.genai import types
 
@@ -111,23 +114,60 @@ class ZekiAnalizci:
             return False
         return True
 
-    def _cevabi_uret(self, soru, pil_image, temperature=0.5, max_output_tokens=3200):
+    def _prepare_image_content(self, pil_image):
+        if pil_image is None:
+            return None
+
+        if isinstance(pil_image, Image.Image):
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+            return pil_image
+
+        if isinstance(pil_image, (bytes, bytearray)):
+            return types.File(value=bytes(pil_image), mime_type="image/png")
+
+        return pil_image
+
+    def _extract_text(self, response):
+        if not response:
+            return ""
+        if hasattr(response, "text") and response.text:
+            return str(response.text)
+
+        candidates = getattr(response, "candidates", None)
+        if candidates:
+            first = candidates[0]
+            if hasattr(first, "content") and first.content:
+                return str(first.content)
+            if hasattr(first, "text") and first.text:
+                return str(first.text)
+
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, str) and parsed.strip():
+            return parsed
+
+        return ""
+
+    def _gorsel_cevabi_uret(self, soru, pil_image, temperature=0.5, max_output_tokens=3200, system_instruction=None):
+        image_content = self._prepare_image_content(pil_image)
         config_ayarlari = types.GenerateContentConfig(
-            system_instruction=self.gorsel_system_instruction,
+            system_instruction=system_instruction or self.gorsel_system_instruction,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            response_mime_type="text/plain",
         )
         return self.client.models.generate_content(
             model=self.model_id,
-            contents=[soru, pil_image],
+            contents=[soru, image_content],
             config=config_ayarlari,
         )
 
-    def _metin_cevabi_uret(self, soru, baglam="", temperature=0.7, max_output_tokens=3200):
+    def _metin_cevabi_uret(self, soru, baglam="", temperature=0.7, max_output_tokens=3200, system_instruction=None):
         config_ayarlari = types.GenerateContentConfig(
-            system_instruction=self.sohbet_system_instruction,
+            system_instruction=system_instruction or self.sohbet_system_instruction,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            response_mime_type="text/plain",
         )
         metin = soru.strip()
         if baglam.strip():
@@ -147,6 +187,7 @@ class ZekiAnalizci:
             ),
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            response_mime_type="text/plain",
             tools=[{"google_search": {}}]
         )
         metin = soru.strip()
@@ -158,6 +199,72 @@ class ZekiAnalizci:
             config=config_ayarlari,
         )
 
+    def _duckduckgo_instant_answer(self, soru: str) -> str:
+        try:
+            response = requests.get(
+                "https://api.duckduckgo.com/",
+                params={
+                    "q": soru,
+                    "format": "json",
+                    "no_redirect": "1",
+                    "skip_disambig": "1",
+                    "t": "gormeengelli-asistan"
+                },
+                timeout=8,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("Answer"):
+                return data["Answer"].strip()
+
+            abstract = data.get("AbstractText", "").strip()
+            if abstract:
+                return abstract
+
+            related = data.get("RelatedTopics", [])
+            snippets = []
+            for topic in related[:3]:
+                text = topic.get("Text") or topic.get("Name")
+                if text:
+                    snippets.append(text.strip())
+            if snippets:
+                return " ".join(snippets)
+
+            return ""
+        except Exception as e:
+            print(f"[DUCKDUCKGO FALLBACK HATASI]: {e}")
+            return ""
+
+    def _bing_search_fallback(self, soru: str) -> str:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = requests.get(
+                "https://www.bing.com/search",
+                params={"q": soru, "mkt": "tr-TR"},
+                headers=headers,
+                timeout=10,
+            )
+            response.raise_for_status()
+            html = response.text
+            matches = re.findall(r'<li class="b_algo".*?</li>', html, flags=re.S)
+            for block in matches[:6]:
+                snippet_match = re.search(r'<p[^>]*>(.*?)</p>', block, flags=re.S)
+                if snippet_match:
+                    snippet = re.sub(r'<.*?>', '', snippet_match.group(1)).strip()
+                    if len(snippet) >= 20:
+                        return snippet
+            for block in matches[:6]:
+                title_match = re.search(r'<h2.*?<a[^>]*>(.*?)</a>', block, flags=re.S)
+                if title_match:
+                    title = re.sub(r'<.*?>', '', title_match.group(1)).strip()
+                    if len(title) >= 20:
+                        return title
+            return ""
+        except Exception as e:
+            print(f"[BING FALLBACK HATASI]: {e}")
+            return ""
+
     def internette_ara_ve_cevapla(self, soru, baglam=""):
         if not soru or not soru.strip():
             return "İnternette ne aratmamı istersin? Tam duyamadım."
@@ -168,21 +275,29 @@ class ZekiAnalizci:
         while deneme < deneme_siniri:
             try:
                 response = self._internet_cevabi_uret(soru, baglam=baglam)
-                if response and response.text:
-                    cevap = response.text.strip()
-                    if cevap:
-                        return cevap
-                return "Aradığın konuya dair internette net bir güncel veri bulamadım."
+                cevap = self._extract_text(response).strip()
+                if cevap and len(cevap.split()) >= 4:
+                    return cevap
+                break
             except Exception as e:
                 error_msg = str(e)
                 deneme += 1
                 print(f"[İNTERNET API HATASI - {self.model_id}]: {error_msg}")
-                
+
                 if "429" in error_msg:
                     time.sleep(2)
-                
+
                 self._model_degistir_ve_yonlendir(error_msg)
                 continue
+
+        # Gemini canlı arama desteklemez veya yeterli sonuç vermediğinde yedek olarak DuckDuckGo ve Bing kullan.
+        fallback = self._duckduckgo_instant_answer(soru)
+        if fallback:
+            return fallback
+
+        bing_fallback = self._bing_search_fallback(soru)
+        if bing_fallback:
+            return bing_fallback
 
         return "Şu an canlı arama sunucularına bağlanamıyorum."
 
@@ -214,19 +329,19 @@ class ZekiAnalizci:
 
         return "Şu an sohbet motoruna erişemiyorum; biraz sonra tekrar deneyelim."
 
-    def analiz_et(self, pil_image, soru="Önümde ne var?"):
+    def analiz_et(self, pil_image, soru="Önümde ne var?", system_instruction=None):
         if pil_image is None:
             return "Görüntü verisi alınamadı."
 
-        deneme_siniri = len(self.api_anahtarlari) * len(self.model_havuzu) * 2
+        deneme_siniri = max(1, len(self.api_anahtarlari) * len(self.model_havuzu) * 2)
         deneme = 0
 
         while deneme < deneme_siniri:
             try:
-                response = self._cevabi_uret(soru, pil_image)
-                if response and response.text:
-                    # Düzeltme ve cımbızlama döngüsü iptal edildi, ham ve tam metin doğrudan döndürülüyor.
-                    return response.text.strip()
+                response = self._gorsel_cevabi_uret(soru, pil_image, system_instruction=system_instruction)
+                cevap = self._extract_text(response).strip()
+                if cevap:
+                    return cevap
                 return "Şu an net bir görüntü alamadım."
             except Exception as e:
                 error_msg = str(e)
