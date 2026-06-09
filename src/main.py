@@ -215,13 +215,22 @@ def is_room_description_request(soru: str) -> bool:
         "hangi oda", "bulunduğum oda", "bulunduğum odayı betimler", "bulunduğum odayı betimler misin",
         "şu an neredeyim", "neredeyim",
         # Görsel betimleme için sık kullanılan sorular
-        "ne var", "önümde ne var", "önümde ne", "karşımda ne var", "karşımda ne", "şu an önümde ne var",
         "odada ne var", "odayı betimler misin", "odamda ne var"
     ]
     return any(k in text for k in anahtarlar)
 
 
-def soruyu_zenginlestir(soru, sahne_ozeti, profil_ozeti, anlik_konum, pusula_verisi, room_request: bool = False):
+def is_visual_information_request(soru: str) -> bool:
+    text = soru.lower()
+    anahtarlar = [
+        "gördüğün", "ne olduğunu", "hangi nesnen", "hangi nesne", "bu ne", "ne yazıyor",
+        "yazıyor", "okur musun", "metin", "okumak", "okur musun", "yazıyı",
+        "anlat", "anlatır", "anlatır mısın", "betimle", "betimler misin", "betimlemesini"
+    ]
+    return any(k in text for k in anahtarlar)
+
+
+def soruyu_zenginlestir(soru, sahne_ozeti, profil_ozeti, anlik_konum, pusula_verisi, visual_info_request: bool = False, room_request: bool = False):
     if room_request:
         return (
             "Sen 'Yaver' adlı, görme engelli bireyler için profesyonel bir görsel asistanısın."
@@ -236,6 +245,20 @@ def soruyu_zenginlestir(soru, sahne_ozeti, profil_ozeti, anlik_konum, pusula_ver
             "1. Bu soruda rota bilgisi verme; sadece odayı, duvarları, zemini ve önemli nesnelerin yerini anlat.\n"
             "2. Eğer odayı kesin olarak belirleyebiliyorsan açıkla. Eğer emin değilsen, görsel detaylarla tahminini destekle.\n"
             "3. KISITLAMA: 15 kelimeyi geçme, ama oda tanımı yeterince açık olsun.\n"
+        )
+    if visual_info_request:
+        return (
+            "Sen 'Yaver' adlı, görme engelli bireyler için profesyonel bir görsel asistanısın."
+            " Bu soruda kullanıcı çevredeki nesnelerin kimliğini, yazıları veya gördüğün görselin ne olduğunu bilmek istiyor."
+            " Lütfen yalnızca bu bilgiyi ver; rota veya hedef yönlendirmesi yapma."
+            " Cevabını kısa, net ve doğrudan tut.\n\n"
+            f"KULLANICI VERİLERİ:\n"
+            f"- Konum: {anlik_konum}\n"
+            f"- Görüntüdeki Nesneler: {sahne_ozeti}\n\n"
+            "REHBERLİK PROTOKOLÜ:\n"
+            "1. Bu soruda rota bilgisinden kaçın. Sadece nesnelerin kimliğini veya yazıları belirt.\n"
+            "2. Eğer yazı varsa tam olarak ne yazdığını söyle.\n"
+            "3. Cümlelerin kısa ve görsel odaklı olsun.\n"
         )
 
     return (
@@ -318,7 +341,7 @@ def run_text_reply(beyin, asistan_ses, soru, profil_store, gecmis):
         print(f"[SES MOTORU HATA]: {e}")
     return duzgun_cevap
 
-def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store, anlik_konum, radar_verisi, spatial_store, pusula_verisi, obstacle_filter: ObstacleFilter, nav_target: str | None = None):
+def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store, anlik_konum, radar_verisi, spatial_store, pusula_verisi, obstacle_filter: ObstacleFilter, nav_target: str | None = None, visual_info_request: bool = False):
     if kare_kopyasi is None:
         return "Görüntü verisi alınamadı."
 
@@ -335,6 +358,7 @@ def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store,
     etkin_konum = tahmin_edilen_oda or anlik_konum
 
     oda_talepli = is_room_description_request(soru)
+    visual_info_request = visual_info_request or oda_talepli or is_visual_information_request(soru)
     soru_lower = soru.lower()
     kare_genisligi = iyilestirilmis_kare.shape[1]
     all_scene_summary = sahne_ozeti_olustur(nesneler, kare_genisligi)
@@ -364,6 +388,7 @@ def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store,
     # --- 2. ADIM: ZENGİNLEŞTİRİLMİŞ SORGULAMA (Pusula Verisi ile) ---
     sorgu = soruyu_zenginlestir(
         soru, sahne_ozeti, profil_store.describe(), etkin_konum, pusula_verisi,
+        visual_info_request=visual_info_request,
         room_request=oda_talepli
     )
     
@@ -371,46 +396,26 @@ def run_visual_reply(beyin, gozu, asistan_ses, soru, kare_kopyasi, profil_store,
         sorgu += f"\n\n[DİNAMİK RADAR VERİSİ]:\n{radar_verisi}"
 
     # --- 3. ADIM: ANALİZ ---
-    # Eğer kullanıcı oda betimlemesi istedi ancak sahnede tek bir nesne tespit edildiyse (ör: yatak),
-    # kullanıcının niyetinin hedefe yönlendirme olabileceğini varsay ve navigasyon akışına çevir.
-    if oda_talepli and len(nesneler) == 1:
-        sadece = nesneler[0].get('ad','').lower()
-        if sadece in {'yatak', 'bed', 'yatak odası'}:
-            nav_target = nesneler[0].get('ad')
-
-    # Navigasyon hedefi açıkça belirtilmişse navigasyon akışına çevir
-    if nav_target:
+    if nav_target and not oda_talepli:
         sorgu = f"HEDEF: {nav_target}. {sorgu}"
         system_override = (
             "Sen görme engelli bir birey için mikro-navigasyon sağlayan bir asistansın. "
             "Kullanıcının hedefe ulaşması için sadece ilk birkaç adımı ver; asla tüm rotayı söyleme."
         )
+    elif oda_talepli:
+        system_override = (
+            "Sen görme engelli bir birey için profesyonel bir görsel asistanısın. "
+            "Bu soruda kullanıcı bulunduğu odayı ve mevcut konumunu anlamak istiyor. "
+            "Lütfen sadece oda tanımı, çevre ve nesnelerin konumunu ver; rota veya hedef yönlendirmesi yapma."
+        )
+    elif visual_info_request:
+        system_override = (
+            "Sen görme engelli bir birey için profesyonel bir görsel asistanısın. "
+            "Bu soruda kullanıcı çevredeki nesnelerin kimliğini, yazıları veya gördüğün görselin ne olduğunu bilmek istiyor. "
+            "Lütfen rota veya hedef yönlendirmesi yapma."
+        )
     else:
-        if oda_talepli:
-            system_override = (
-                "Sen görme engelli bir birey için profesyonel bir görsel asistanısın. "
-                "Bu soruda kullanıcı bulunduğu odayı ve mevcut konumunu anlamak istiyor. "
-                "Lütfen sadece oda tanımı, çevre ve nesnelerin konumunu ver; rota veya hedef yönlendirmesi yapma."
-            )
-        else:
-            system_override = None
-
-    # Ön odaklı kısa betimleme varsa doğrudan nesneleri listeleyelim
-    if front_request and not nav_target and not oda_talepli:
-        front_objects = []
-        for nesne in nesneler:
-            konum_x = nesne.get("merkez_x", 0)
-            if konum_x > (kare_genisligi/3) and konum_x < (kare_genisligi*2/3):
-                front_objects.append(nesne)
-
-        if front_objects:
-            duzgun_cevap = ", ".join([f"{o.get('ad')}" for o in front_objects])
-            print(f"[ASİSTAN - GÖRSEL - ÖN]: {duzgun_cevap}")
-            try:
-                asistan_ses.konus(duzgun_cevap, bekle=True)
-            except Exception as e:
-                print(f"[SES MOTORU HATA]: {e}")
-            return duzgun_cevap
+        system_override = None
 
     try:
         cevap = beyin.analiz_et(img, soru=sorgu, system_instruction=system_override)
@@ -592,8 +597,8 @@ def main():
                 
                 continue # Hedef belirlendiği için döngünün başına dön
             
-            # ... (router.route(komut) gibi diğer kodlar aşağıda devam eder)
-            route = router.route(komut)
+            # ... (router.route(soru) kullanarak gerçek kullanıcı sorusunu sınıflandırıyoruz)
+            route = router.route(soru)
 
             soru_lower = soru.lower()
             
@@ -616,12 +621,16 @@ def main():
 
             # Fallback: basit kelime tabanlı tetikleyiciler korunsun (ancak yüksek güvenli non-vision intent'ler için atla)
             if not is_gorsel and not suppress_fallback:
-                gorsel_kelimeler = ["betimle", "ne var", "karşımda", "karsimda", "görüyorsun", "goruyorsun", "bak", "oda", "konumu", "döndüm", "dondum", "ilerledim", "geldim", "attım"]
+                gorsel_kelimeler = [
+                    "betimle", "ne var", "karşımda", "karsimda", "görüyorsun", "goruyorsun", "bak",
+                    "oda", "konumu", "döndüm", "dondum", "ilerledim", "geldim", "attım",
+                    "anlat", "anlatır", "anlatır mısın", "anlatmasını", "anlatır mısın"
+                ]
                 is_gorsel = any(k in soru_lower for k in gorsel_kelimeler)
 
             navigasyon_kelimeler = ["götür", "gotur", "tarif", "nasıl giderim", "nasil giderim", "yol göster", "gitmek istiyorum", "götürür müsün"]
             is_navigasyon = any(k in soru_lower for k in navigasyon_kelimeler)
-            
+            visual_info_request = is_visual_information_request(soru) or (is_gorsel and not is_navigasyon)
 
             # ======= 🔥 HAKAN'IN SIZDIRMAZ GÖREV KİLİDİ =======
             if is_gorsel or is_navigasyon:
@@ -635,18 +644,19 @@ def main():
                     # Pusula verisini fonksiyona gönderiyoruz
                     # Öncelikle router'ın çıkardığı hedefi kullan; yoksa anahtar eşlemeyle yedekle
                     detected_target = None
-                    if hasattr(route, 'target') and route.target:
-                        detected_target = route.target
-                    else:
-                        for anahtar, hedef_adi in otopilot_hedefler.items():
-                            if anahtar in soru_lower:
-                                detected_target = hedef_adi
-                                break
+                    if is_navigasyon:
+                        if hasattr(route, 'target') and route.target:
+                            detected_target = route.target
+                        else:
+                            for anahtar, hedef_adi in otopilot_hedefler.items():
+                                if anahtar in soru_lower:
+                                    detected_target = hedef_adi
+                                    break
 
                     yanit = run_visual_reply(
-                        beyin, gozu, asistan_ses, soru, kare_kopyasi, 
+                        beyin, gozu, asistan_ses, soru, kare_kopyasi,
                         profil_store, mevcut_konum, giden_radar, spatial_store, giden_pusula,
-                        obstacle_filter, nav_target=detected_target
+                        obstacle_filter, nav_target=detected_target, visual_info_request=visual_info_request
                     )
                     konusma_gecmisi.append(f"Kullanıcı: {soru}")
                     konusma_gecmisi.append(f"Asistan: {yanit}")

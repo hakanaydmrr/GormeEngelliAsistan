@@ -7,6 +7,7 @@ from PIL import Image
 import requests
 from google import genai
 from google.genai import types
+from .latency_logger import log_latency
 
 
 class ZekiAnalizci:
@@ -156,11 +157,15 @@ class ZekiAnalizci:
             temperature=temperature,
             response_mime_type="text/plain",
         )
-        return self.client.models.generate_content(
+        start_time = time.time()
+        response = self.client.models.generate_content(
             model=self.model_id,
             contents=[soru, image_content],
             config=config_ayarlari,
         )
+        latency_ms = (time.time() - start_time) * 1000
+        log_latency("cloud_cognitive", latency_ms, {"model_id": self.model_id, "request_type": "visual"})
+        return response
 
     def _metin_cevabi_uret(self, soru, baglam="", temperature=0.7, max_output_tokens=3200, system_instruction=None):
         config_ayarlari = types.GenerateContentConfig(

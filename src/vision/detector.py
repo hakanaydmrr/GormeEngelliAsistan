@@ -1,5 +1,7 @@
 import cv2
+import time
 from ultralytics import YOLO
+from .latency_logger import log_latency
 
 class GormeEngelliGozu:
     def __init__(self, model_path="yolov8m.pt"):
@@ -13,7 +15,10 @@ class GormeEngelliGozu:
         Görüntüdeki nesneleri tanır, merkez koordinatlarını, kapladığı alan oranını
         ve merkezde olup olmadığını hesaplar.
         """
+        start_time = time.time()
         results = self.model(frame, verbose=False)
+        local_latency_ms = (time.time() - start_time) * 1000
+        log_latency("local_reflex", local_latency_ms, {"frame_shape": frame.shape})
         tespitler = []
 
         # Ekran boyutlarını alıyoruz (Normalizasyon için)
@@ -53,6 +58,12 @@ class GormeEngelliGozu:
                         "guven": conf,
                         "merkez_x": merkez_x,
                         "merkez_y": merkez_y,
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                        "width": nesne_genislik,
+                        "height": nesne_yukseklik,
                         "alan_orani": alan_orani,  # Ne kadar yakın olduğunu söyler
                         "onunde_mi": onunde_mi     # Tam çarpma rotasında mı olduğunu söyler
                     })

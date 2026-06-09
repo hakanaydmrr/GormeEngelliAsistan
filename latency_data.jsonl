@@ -1,0 +1,10 @@
+{"timestamp": "2026-05-31T12:54:08.781066Z", "component": "local_reflex", "ms": 580.8429718017578, "metadata": {"frame_shape": [600, 800, 3]}}
+{"timestamp": "2026-05-31T12:54:24.828594Z", "component": "cloud_cognitive", "ms": 16042.056322097778, "metadata": {"model_id": "gemini-2.5-flash", "request_type": "visual"}}
+{"timestamp": "2026-05-31T13:02:31.957816Z", "component": "local_reflex", "ms": 601.8228530883789, "metadata": {"frame_shape": [600, 800, 3]}}
+{"timestamp": "2026-05-31T13:02:48.611391Z", "component": "cloud_cognitive", "ms": 16647.931575775146, "metadata": {"model_id": "gemini-2.5-flash", "request_type": "visual"}}
+{"timestamp": "2026-05-31T13:07:58.170569Z", "component": "local_reflex", "ms": 685.7521533966064, "metadata": {"frame_shape": [600, 800, 3]}}
+{"timestamp": "2026-05-31T13:08:01.065026Z", "component": "cloud_cognitive", "ms": 2892.751455307007, "metadata": {"model_id": "gemini-2.5-flash", "request_type": "visual"}}
+{"timestamp": "2026-05-31T13:15:37.841823Z", "component": "local_reflex", "ms": 541.9278144836426, "metadata": {"frame_shape": [600, 800, 3]}}
+{"timestamp": "2026-05-31T13:15:41.954683Z", "component": "cloud_cognitive", "ms": 4109.7259521484375, "metadata": {"model_id": "gemini-2.5-flash", "request_type": "visual"}}
+{"timestamp": "2026-06-09T09:13:12.112232Z", "component": "local_reflex", "ms": 478.2435894012451, "metadata": {"frame_shape": [600, 800, 3]}}
+{"timestamp": "2026-06-09T09:15:01.573405Z", "component": "cloud_cognitive", "ms": 3846.127986907959, "metadata": {"model_id": "gemini-2.5-flash", "request_type": "visual"}}
